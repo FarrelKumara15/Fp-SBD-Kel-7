@@ -13,7 +13,7 @@ const mysqlConnection = mysql.createConnection({
     host: 'localhost',
     user: 'root',
     password: '', 
-    database: 'sbd_streaming_musik'
+    database: 'fp_sbd'
 });
 
 mysqlConnection.connect((err) => {
@@ -27,7 +27,7 @@ mysqlConnection.connect((err) => {
 // =================================================================
 // 2. KONEKSI KE MONGODB (Data Dinamis & Log)
 // =================================================================
-mongoose.connect('mongodb://localhost:27017/sbd_streaming_nosql')
+mongoose.connect('mongodb://localhost:27017/FP_SBD')
     .then(() => console.log('✅ Berhasil terhubung ke MongoDB (Data Dinamis)'))
     .catch((err) => console.error('❌ Koneksi MongoDB Gagal:', err.message));
 
@@ -306,96 +306,684 @@ app.delete('/api/playlists/remove-song', (req, res) => { // [cite: 41]
 });
 
 // =================================================================
-// FUNGSI 7: TAMBAH LAGU KE FAVORIT (MongoDB Embedding Mock)
+// DEFINISI SKEMA & MODEL MONGOOSE (NON-RELATIONAL DATABASE)
 // =================================================================
-app.post('/api/favorites', (req, res) => {
-    const { id_user, id_song, title, artist_name } = req.body;
 
-    if (!id_user || !id_song) {
-        return res.status(400).json({ message: "Gagal! ID User dan ID Song wajib ada." });
+// 1. Skema Favorites (Array Embedding)
+const FavoritesSchema = new mongoose.Schema({
+    user_id: { type: Number, required: true, unique: true },
+    songs: [{
+        song_id: Number,
+        title: String,
+        artist_id: Number,
+        artist_name: String,
+        genre: String,
+        duration: Number,
+        added_at: { type: Date, default: Date.now }
+    }],
+    total_favorites: { type: Number, default: 0 },
+    updated_at: { type: Date, default: Date.now }
+});
+const Favorite = mongoose.model('Favorite', FavoritesSchema, 'favorites');
+
+// 2. Skema Artist Follows (Array Embedding)
+const ArtistFollowsSchema = new mongoose.Schema({
+    user_id: { type: Number, required: true, unique: true },
+    artists: [{
+        artist_id: Number,
+        artist_name: String,
+        country: String,
+        genre: String,
+        followed_at: { type: Date, default: Date.now }
+    }],
+    total_following: { type: Number, default: 0 },
+    updated_at: { type: Date, default: Date.now }
+});
+const ArtistFollow = mongoose.model('ArtistFollow', ArtistFollowsSchema, 'artist_follows');
+
+// 3. Skema Playback History (1 Dokumen per Pemutaran)
+const PlaybackHistorySchema = new mongoose.Schema({
+    user_id: Number,
+    song_id: Number,
+    song_title: String,
+    artist_id: Number,
+    artist_name: String,
+    genre: String,
+    duration: Number,
+    listened_duration: Number,
+    completed: Boolean,
+    played_at: { type: Date, default: Date.now },
+    device: String,
+    source: String
+});
+const PlaybackHistory = mongoose.model('PlaybackHistory', PlaybackHistorySchema, 'playback_history');
+
+// =================================================================
+// 4. Skema User Preferences Otomatis
+// =================================================================
+// User preference tidak diisi manual.
+// Data preference dibuat otomatis dari:
+// 1. Lagu favorit user
+// 2. Playback history user selama 7 hari terakhir
+const UserPreferencesSchema = new mongoose.Schema({
+  user_id: {
+    type: Number,
+    required: true,
+    unique: true
+  },
+
+  // Genre favorit hasil scoring dari favorites dan playback_history
+  favorite_genres: [String],
+
+  // Artist favorit hasil scoring dari favorites dan playback_history
+  preferred_artists: [
+    {
+      artist_id: Number,
+      artist_name: String,
+      score: Number
     }
+  ],
 
-    res.status(200).json({
-        message: "MOCK TEST: Lagu berhasil di-embed ke dalam array Favorit User di MongoDB!",
-        data: {
-            id_user: id_user,
-            songs: [
-                { id_song, title, artist_name, added_at: new Date() }
-            ]
-        }
-    });
+  // Lagu yang sering diputar selama 7 hari terakhir
+  frequent_songs_last_7_days: [
+    {
+      song_id: Number,
+      title: String,
+      artist_id: Number,
+      artist_name: String,
+      genre: String,
+      total_played: Number,
+      last_played_at: Date
+    }
+  ],
+
+  // Penanda sumber data preference
+  source: [String],
+
+  // Periode data playback history yang dianalisis
+  generated_from_history_start: Date,
+  generated_from_history_end: Date,
+
+  updated_at: {
+    type: Date,
+    default: Date.now
+  }
 });
 
-// =================================================================
-// FUNGSI 8: FOLLOW ARTIST (MongoDB Embedding Mock)
-// =================================================================
-app.post('/api/artists/follow', (req, res) => {
-    const { id_user, id_artist, artist_name } = req.body;
+const UserPreference = mongoose.model(
+  'UserPreference',
+  UserPreferencesSchema,
+  'user_preferences'
+);
 
-    if (!id_user || !id_artist) {
-        return res.status(400).json({ message: "Gagal! ID User dan ID Artist wajib ada." });
-    }
+// =================================================================
+// HELPER: Fungsi untuk menambahkan score genre atau artist
+// =================================================================
+function addScore(map, key, data, score) {
+  // Jika key kosong/null, tidak perlu dihitung
+  if (!key) return;
 
-    res.status(200).json({
-        message: `MOCK TEST: Berhasil mengikuti artist '${artist_name}' di MongoDB!`,
-        data: {
-            id_user: id_user,
-            followed_artists: [
-                { id_artist, artist_name, followed_at: new Date() }
-            ]
-        }
+  // Jika key belum ada di Map, buat data awal
+  if (!map.has(key)) {
+    map.set(key, {
+      ...data,
+      score: 0
     });
+  }
+
+  // Tambahkan score
+  map.get(key).score += score;
+}
+
+// =================================================================
+// FUNGSI 7: TAMBAH/HAPUS FAVORIT LAGU
+// =================================================================
+
+// --- 7A. Menambahkan Lagu ke Favorit (Dengan Pengecekan Validitas ID ke MySQL) ---
+app.post('/api/favorites', async (req, res) => {
+    try {
+        const { user_id, song_id } = req.body;
+
+        if (!user_id || !song_id) {
+            return res.status(400).json({ message: "Gagal! user_id dan song_id wajib diisi." });
+        }
+
+        // TAHAP 1: Mampir ke MySQL dulu untuk memastikan song_id beneran ada di katalog lagu kelompok 7
+        // Kita gunakan JOIN ke tabel artists sekaligus untuk menarik data nama musisi secara otomatis
+        const cekMySQLQuery = `
+            SELECT songs.title, songs.artist_id, songs.genre, songs.duration, artists.artist_name 
+            FROM songs 
+            JOIN artists ON songs.artist_id = artists.artist_id 
+            WHERE songs.song_id = ?
+        `;
+
+        mysqlConnection.query(cekMySQLQuery, [song_id], async (err, mysqlResults) => {
+            if (err) {
+                return res.status(500).json({ message: "Error saat verifikasi ke database MySQL", error: err.message });
+            }
+
+            // Jika lagu tidak ditemukan di tabel MySQL (panjang array hasil = 0)
+            if (mysqlResults.length === 0) {
+                return res.status(404).json({ 
+                    message: `Gagal menambah favorit! Lagu dengan ID ${song_id} tidak valid atau tidak terdaftar di MySQL.` 
+                });
+            }
+
+            // Ambil semua data atribut lagu yang asli langsung dari baris database MySQL
+            const title = mysqlResults[0].title;
+            const artist_id = mysqlResults[0].artist_id;
+            const artist_name = mysqlResults[0].artist_name;
+            const genre = mysqlResults[0].genre;
+            const duration = mysqlResults[0].duration;
+
+            // TAHAP 2: Jika lolos validasi MySQL, baru lakukan operasi embedding data ke MongoDB
+            const hasilMongo = await Favorite.findOneAndUpdate(
+                { user_id: user_id, "songs.song_id": { $ne: song_id } },
+                {
+                    $push: {
+                        songs: { song_id, title, artist_id, artist_name, genre, duration, added_at: new Date() }
+                    },
+                    $inc: { total_favorites: 1 },
+                    $set: { updated_at: new Date() }
+                },
+                { upsert: true, new: true }
+            );
+
+            if (!hasilMongo) {
+                return res.status(400).json({ message: "Lagu ini sudah ada di dalam daftar favorit user!" });
+            }
+
+            res.status(200).json({ 
+                message: `Berhasil! Lagu '${title}' - ${artist_name} tervalidasi di MySQL dan sukses disimpan ke favorit MongoDB.`, 
+                data: hasilMongo 
+            });
+        });
+
+    } catch (err) {
+        res.status(500).json({ message: "Error internal server", error: err.message });
+    }
 });
 
-// =================================================================
-// FUNGSI 9: RIWAYAT PEMUTARAN LAGU (MongoDB Log Mock)
-// =================================================================
-app.post('/api/playback-history', (req, res) => {
-    const { id_user, id_song, title, artist_name } = req.body;
+// --- 7B. Menghapus Lagu dari Favorit ($pull) ---
+app.delete('/api/favorites', async (req, res) => {
+    try {
+        const { user_id, song_id } = req.body;
 
-    if (!id_user || !id_song) {
-        return res.status(400).json({ message: "Gagal! ID User dan ID Song wajib diisi." });
+        // Logika query: Mencari dokumen berdasarkan user_id dan memastikan song_id tersebut eksis di dalam array.
+        const hasil = await Favorite.findOneAndUpdate(
+            { user_id: user_id, "songs.song_id": song_id },
+            {
+                $pull: { songs: { song_id: song_id } }, // Mengeluarkan objek lagu dari array songs
+                $inc: { total_favorites: -1 }, // Mengurangi counter total favorit
+                $set: { updated_at: new Date() }
+            },
+            { new: true }
+        );
+
+        if (!hasil) return res.status(404).json({ message: "Data tidak ditemukan atau lagu memang tidak ada di favorit." });
+        res.status(200).json({ message: "Lagu berhasil dihapus dari favorit!", data: hasil });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
-
-    res.status(201).json({
-        message: "MOCK TEST: Riwayat pemutaran lagu berhasil dicatat ke MongoDB log!",
-        data: {
-            _id: "666abc12399f9fa", // Simulasi Objectid bawaan MongoDB
-            id_user,
-            id_song,
-            title,
-            artist_name,
-            played_at: new Date()
-        }
-    });
 });
 
-// =================================================================
-// FUNGSI 10 & 11: PREFERENSI & REKOMENDASI LAGU (MongoDB Mock)
-// =================================================================
-app.get('/api/users/:id/recommendations', (req, res) => {
-    const id_user = req.params.id; // Mengambil ID User dari URL (misal: /api/users/17/recommendations)
+// --- 7C. Menampilkan Semua Lagu Favorit User ---
+app.get('/api/users/:userId/favorites', async (req, res) => {
+    try {
+        const user_id = req.params.userId;
+        // Proyeksi { songs: 1, total_favorites: 1, _id: 0 } digunakan untuk menghemat bandwidth
+        // dengan hanya mengambil properti array songs tanpa mengikutkan properti _id bawaan Mongo.
+        const hasil = await Favorite.findOne({ user_id: user_id }, { songs: 1, total_favorites: 1, _id: 0 });
+        res.status(200).json({ data: hasil || { songs: [], total_favorites: 0 } });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-    // MOCK DATA: Anggap saja ini data preferensi genre & artist yang ditarik Anggota 2 dari MongoDB user_preferences
-    const mockUserPreference = {
-        id_user: id_user,
-        favorite_genres: ["Grunge", "Rock"],
-        preferred_artists: ["Nirvana", "Artis Tiruan 2"]
+
+// =================================================================
+// FUNGSI 8: FOLLOW/UNFOLLOW ARTIST
+// =================================================================
+
+// --- 8A. Follow Artist (Versi Perbaikan Tanpa Kolom Genre di Artists MySQL) ---
+app.post('/api/artists/follow', async (req, res) => {
+    try {
+        const { user_id, artist_id } = req.body;
+
+        if (!user_id || !artist_id) {
+            return res.status(400).json({ message: "Gagal! user_id and artist_id wajib diisi." });
+        }
+
+        // PERBAIKAN: Menghapus kolom 'genre' karena tidak ada di skema DDL tabel artists MySQL
+        const cekMySQLQuery = `SELECT artist_name, country FROM artists WHERE artist_id = ?`;
+
+        mysqlConnection.query(cekMySQLQuery, [artist_id], async (err, mysqlResults) => {
+            if (err) {
+                return res.status(500).json({ message: "Error saat mengecek database MySQL", error: err.message });
+            }
+
+            if (mysqlResults.length === 0) {
+                return res.status(404).json({ 
+                    message: `Gagal mem-follow! Artist dengan ID ${artist_id} tidak terdaftar di katalog MySQL kelompok 7.` 
+                });
+            }
+
+            // Ambil data asli dari MySQL yang tersedia
+            const artist_name = mysqlResults[0].artist_name;
+            const country = mysqlResults[0].country;
+
+            // Lanjutkan proses insert data embedding ke MongoDB
+            const hasilMongo = await ArtistFollow.findOneAndUpdate(
+                { user_id: user_id, "artists.artist_id": { $ne: artist_id } },
+                {
+                    $push: {
+                        artists: { artist_id, artist_name, country, followed_at: new Date() } // Kolom genre dihilangkan agar aman
+                    },
+                    $inc: { total_following: 1 },
+                    $set: { updated_at: new Date() }
+                },
+                { upsert: true, new: true }
+            );
+
+            if (!hasilMongo) {
+                return res.status(400).json({ message: "Kamu sudah mem-follow artis ini!" });
+            }
+
+            res.status(200).json({ 
+                message: `Berhasil! Musisi '${artist_name}' tervalidasi di MySQL dan sukses di-follow di MongoDB.`, 
+                data: hasilMongo 
+            });
+        });
+
+    } catch (err) {
+        res.status(500).json({ message: "Error internal server", error: err.message });
+    }
+});
+
+// --- 8B. Unfollow Artist (Versi Efisien Murni MongoDB) ---
+app.delete('/api/artists/unfollow', async (req, res) => {
+    try {
+        const { user_id, artist_id } = req.body;
+
+        if (!user_id || !artist_id) {
+            return res.status(400).json({ message: "Gagal! user_id dan artist_id wajib diisi." });
+        }
+
+        // Langsung cari dokumen di MongoDB berdasarkan user_id dan pastikan artist_id eksis di array
+        const hasilMongo = await ArtistFollow.findOneAndUpdate(
+            { user_id: user_id, "artists.artist_id": artist_id }, // Validasi langsung di Mongo
+            {
+                $pull: { artists: { artist_id: artist_id } }, // Mengeluarkan objek artist dari array
+                $inc: { total_following: -1 }, // Mengurangi counter jumlah following
+                $set: { updated_at: new Date() }
+            },
+            { new: true }
+        );
+
+        // Jika user ternyata belum pernah mem-follow artist tersebut di MongoDB
+        if (!hasilMongo) {
+            return res.status(404).json({ 
+                message: "Gagal unfollow! Data tidak ditemukan atau kamu memang belum mem-follow musisi ini." 
+            });
+        }
+
+        res.status(200).json({ 
+            message: "Berhasil! Sukses unfollow musisi dari daftar MongoDB.", 
+            data: hasilMongo 
+        });
+
+    } catch (err) {
+        res.status(500).json({ message: "Error internal server", error: err.message });
+    }
+});
+
+
+// =================================================================
+// FUNGSI 9: RIWAYAT PEMUTARAN LAGU
+// =================================================================
+app.post('/api/playback-history', async (req, res) => {
+    try {
+        // Logika skema: Menggunakan pendekatan 1 dokumen per pemutaran (bukan array embedding besar).
+        // Hal ini dirancang karena data log transaksi pemutaran bertambah dengan intensitas tinggi (High-Frequency).
+        const logBaru = new PlaybackHistory(req.body);
+        await logBaru.save();
+        res.status(201).json({ message: "Riwayat pemutaran lagu berhasil dicatat!", data: logBaru });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+// =================================================================
+// FUNGSI 10: REKOMENDASI MUSIK BERDASARKAN USER PREFERENCES OTOMATIS
+// =================================================================
+app.get('/api/users/:userId/recommendations', async (req, res) => {
+  try {
+    const user_id = parseInt(req.params.userId);
+
+    // Ambil user preference yang sudah digenerate otomatis
+    const preferensiUser = await UserPreference.findOne(
+      { user_id: user_id },
+      {
+        favorite_genres: 1,
+        preferred_artists: 1,
+        _id: 0
+      }
+    );
+
+    // Jika preference belum ada, user harus generate dulu
+    if (!preferensiUser) {
+      return res.status(404).json({
+        message: "User preference belum tersedia. Jalankan endpoint generate terlebih dahulu.",
+        generate_endpoint: `/api/users/${user_id}/preferences/generate`,
+        recommendations: []
+      });
+    }
+
+    const favoriteGenres = preferensiUser.favorite_genres || [];
+
+    const preferredArtistIds = (preferensiUser.preferred_artists || [])
+      .map((artist) => Number(artist.artist_id))
+      .filter((id) => Number.isInteger(id));
+
+    const whereParts = [];
+    const params = [];
+
+    // Rekomendasi berdasarkan genre favorit
+    if (favoriteGenres.length > 0) {
+      whereParts.push(`songs.genre IN (${favoriteGenres.map(() => "?").join(",")})`);
+      params.push(...favoriteGenres);
+    }
+
+    // Rekomendasi berdasarkan artist favorit
+    if (preferredArtistIds.length > 0) {
+      whereParts.push(`artists.artist_id IN (${preferredArtistIds.map(() => "?").join(",")})`);
+      params.push(...preferredArtistIds);
+    }
+
+    if (whereParts.length === 0) {
+      return res.status(200).json({
+        message: "Preference belum memiliki genre atau artist yang cukup untuk rekomendasi.",
+        recommendations: []
+      });
+    }
+
+    // Query MySQL untuk mengambil lagu yang sesuai preference
+    const query = `
+      SELECT 
+          songs.song_id,
+          songs.title,
+          songs.genre,
+          songs.duration,
+          songs.release_date,
+          songs.audio_url,
+          artists.artist_id,
+          artists.artist_name
+      FROM songs
+      JOIN artists
+          ON songs.artist_id = artists.artist_id
+      WHERE ${whereParts.join(" OR ")}
+      ORDER BY songs.title ASC
+      LIMIT 10
+    `;
+
+    mysqlConnection.query(query, params, (err, results) => {
+      if (err) {
+        return res.status(500).json({
+          message: "Gagal membuat rekomendasi lagu",
+          error: err.message
+        });
+      }
+
+      res.status(200).json({
+        message: "Rekomendasi musik berhasil dibuat berdasarkan user preference otomatis.",
+        source: "favorites + playback_history_last_7_days",
+        preference: preferensiUser,
+        recommendations: results
+      });
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: "Error internal server",
+      error: err.message
+    });
+  }
+});
+
+
+// =================================================================
+// FUNGSI 11: USER PREFERENCES OTOMATIS
+// =================================================================
+
+// --- 11A. Generate User Preferences dari Favorites dan Playback History 7 Hari Terakhir ---
+app.post('/api/users/:userId/preferences/generate', async (req, res) => {
+  try {
+    const user_id = parseInt(req.params.userId);
+
+    // Batas waktu 7 hari terakhir
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    // =========================================================
+    // 1. Ambil lagu favorit user dari collection favorites
+    // =========================================================
+    const favoriteDoc = await Favorite.findOne(
+      { user_id: user_id },
+      {
+        songs: 1,
+        _id: 0
+      }
+    );
+
+    const favoriteSongs = favoriteDoc?.songs || [];
+
+    // =========================================================
+    // 2. Ambil lagu yang sering diputar selama 7 hari terakhir
+    // =========================================================
+    const frequentSongs = await PlaybackHistory.aggregate([
+      {
+        $match: {
+          user_id: user_id,
+          played_at: {
+            $gte: sevenDaysAgo
+          }
+        }
+      },
+      {
+        $group: {
+          _id: "$song_id",
+
+          song_id: {
+            $first: "$song_id"
+          },
+
+          // Di schema GitHub, nama field judul lagu adalah song_title
+          title: {
+            $first: "$song_title"
+          },
+
+          artist_id: {
+            $first: "$artist_id"
+          },
+
+          artist_name: {
+            $first: "$artist_name"
+          },
+
+          genre: {
+            $first: "$genre"
+          },
+
+          total_played: {
+            $sum: 1
+          },
+
+          last_played_at: {
+            $max: "$played_at"
+          }
+        }
+      },
+      {
+        $sort: {
+          total_played: -1,
+          last_played_at: -1
+        }
+      },
+      {
+        $limit: 10
+      },
+      {
+        $project: {
+          _id: 0,
+          song_id: 1,
+          title: 1,
+          artist_id: 1,
+          artist_name: 1,
+          genre: 1,
+          total_played: 1,
+          last_played_at: 1
+        }
+      }
+    ]);
+
+    // =========================================================
+    // 3. Hitung score genre dan artist
+    // =========================================================
+    const genreScore = new Map();
+    const artistScore = new Map();
+
+    // Lagu favorit diberi bobot 2 karena user sengaja menyimpan lagu tersebut
+    favoriteSongs.forEach((song) => {
+      addScore(
+        genreScore,
+        song.genre,
+        {
+          genre: song.genre
+        },
+        2
+      );
+
+      const artistKey = song.artist_id || song.artist_name;
+
+      addScore(
+        artistScore,
+        artistKey,
+        {
+          artist_id: song.artist_id || null,
+          artist_name: song.artist_name
+        },
+        2
+      );
+    });
+
+    // Playback history diberi bobot sesuai total pemutaran
+    frequentSongs.forEach((song) => {
+      addScore(
+        genreScore,
+        song.genre,
+        {
+          genre: song.genre
+        },
+        song.total_played
+      );
+
+      const artistKey = song.artist_id || song.artist_name;
+
+      addScore(
+        artistScore,
+        artistKey,
+        {
+          artist_id: song.artist_id || null,
+          artist_name: song.artist_name
+        },
+        song.total_played
+      );
+    });
+
+    // =========================================================
+    // 4. Bentuk hasil akhir user preference
+    // =========================================================
+    const favoriteGenres = Array.from(genreScore.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5)
+      .map((item) => item.genre);
+
+    const preferredArtists = Array.from(artistScore.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5)
+      .map((item) => ({
+        artist_id: item.artist_id,
+        artist_name: item.artist_name,
+        score: item.score
+      }));
+
+    const preferenceDocument = {
+      user_id: user_id,
+      favorite_genres: favoriteGenres,
+      preferred_artists: preferredArtists,
+      frequent_songs_last_7_days: frequentSongs,
+      source: ["favorites", "playback_history_last_7_days"],
+      generated_from_history_start: sevenDaysAgo,
+      generated_from_history_end: new Date(),
+      updated_at: new Date()
     };
 
-    // LOGIKA FILTERING:
-    // Pura-puranya backend menyaring katalog musik berdasarkan genre preferensi di atas
-    const laguRekomendasiTiruan = [
-        { id_song: 101, title: "Smells Like Teen Spirit", genre: "Grunge", artist_name: "Nirvana" },
-        { id_song: 102, title: "Drain You", genre: "Grunge", artist_name: "Nirvana" },
-        { id_song: 103, title: "Lagu Rock Mantap", genre: "Rock", artist_name: "Artis Tiruan 2" }
-    ];
+    // =========================================================
+    // 5. Simpan hasil generate ke collection user_preferences
+    // =========================================================
+    const hasil = await UserPreference.findOneAndUpdate(
+      {
+        user_id: user_id
+      },
+      preferenceDocument,
+      {
+        upsert: true,
+        new: true
+      }
+    );
 
     res.status(200).json({
-        message: `MOCK TEST: Berhasil menampilkan rekomendasi sederhana untuk User ID ${id_user}`,
-        user_preferences: mockUserPreference,
-        recommendations: laguRekomendasiTiruan
+      message: "User preferences berhasil dibuat otomatis dari favorites dan playback history 7 hari terakhir.",
+      data: hasil
     });
+  } catch (err) {
+    res.status(500).json({
+      message: "Gagal generate user preference",
+      error: err.message
+    });
+  }
+});
+
+// --- 11B. Menampilkan User Preferences Hasil Generate ---
+app.get('/api/users/:userId/preferences', async (req, res) => {
+  try {
+    const user_id = parseInt(req.params.userId);
+
+    const hasil = await UserPreference.findOne(
+      {
+        user_id: user_id
+      },
+      {
+        _id: 0
+      }
+    );
+
+    if (!hasil) {
+      return res.status(404).json({
+        message: "User preference belum dibuat. Jalankan endpoint generate terlebih dahulu.",
+        generate_endpoint: `/api/users/${user_id}/preferences/generate`
+      });
+    }
+
+    res.status(200).json({
+      data: hasil
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: "Gagal mengambil user preference",
+      error: err.message
+    });
+  }
 });
 
 // =================================================================
